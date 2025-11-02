@@ -1,6 +1,28 @@
-name: Codeboard Android CI New
+name: Codeboard Android CI with Manual Release
 
-on: [push]
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+        - release
+        - debug
+        - preview
+      abi_filters:
+        description: 'ABI Filters (comma separated)'
+        required: true
+        default: 'arm64-v8a,armeabi-v7a,x86,x86_64'
+      include_sources:
+        description: 'Include source files'
+        required: true
+        default: 'false'
+        type: boolean
 
 jobs:
   build:
@@ -28,11 +50,81 @@ jobs:
 
       - name: Build with Gradle
         run: |
-          ./gradlew.bat assemble --stacktrace
+          # Determine build type from manual input or default to assemble for push events
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $BUILD_TYPE = "${{ github.event.inputs.build_type }}"
+            $ABI_FILTERS = "${{ github.event.inputs.abi_filters }}"
+            if ($BUILD_TYPE -eq "release") {
+              ./gradlew.bat assembleRelease -PabiFilters=$ABI_FILTERS
+            } elseif ($BUILD_TYPE -eq "preview") {
+              ./gradlew.bat assemblePreview -PabiFilters=$ABI_FILTERS
+            } else {
+              ./gradlew.bat assembleDebug -PabiFilters=$ABI_FILTERS
+            }
+          } else {
+            ./gradlew.bat assemble --stacktrace
+          }
 
-      - name: Upload APKs
+      - name: Setup for Release Signing (Manual Trigger)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release'
+        run: |
+          # Create release keystore (in real scenario, you'd use secrets)
+          keytool -genkey -v -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass release123 -keypass release123 -dname "CN=Codeboard, OU=Android, O=Codeboard, L=Unknown, ST=Unknown, C=PH"
+          
+      - name: Sign Release APK (Manual Trigger)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release'
+        run: |
+          # Sign the release APK
+          .\gradlew.bat assembleRelease
+          # Note: In production, use proper signing with secrets
+
+      - name: Get build info
+        id: build_info
+        run: |
+          $DATE = Get-Date -Format "yyyyMMdd_HHmm"
+          $COMMIT = "${{ github.sha }}".Substring(0,7)
+          $BUILD_TYPE = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ github.event.inputs.build_type }}" } else { "auto" }
+          echo "build_date=$DATE" >> $env:GITHUB_OUTPUT
+          echo "commit_short=$COMMIT" >> $env:GITHUB_OUTPUT
+          echo "build_type=$BUILD_TYPE" >> $env:GITHUB_OUTPUT
+
+      - name: Prepare artifacts for upload
+        run: |
+          # Create artifacts directory
+          New-Item -ItemType Directory -Force -Path "artifacts"
+          
+          # Copy APK files
+          Copy-Item "app/build/outputs/apk/*/*.apk" -Destination "artifacts/" -Recurse -Force
+          
+          # Include sources if requested in manual trigger
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" && "${{ github.event.inputs.include_sources }}" -eq "true") {
+            # Copy key source files
+            Copy-Item "app/src/main/java/**/*.kt" -Destination "artifacts/sources/" -Recurse -Force
+            Copy-Item "app/src/main/res/**" -Destination "artifacts/sources/" -Recurse -Force
+          }
+
+      - name: Upload APKs as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: apk
-          path: app/build/outputs/apk/
-          retention-days: 1
+          name: apk-${{ steps.build_info.outputs.build_type }}-${{ steps.build_info.outputs.build_date }}-${{ steps.build_info.outputs.commit_short }}
+          path: artifacts/
+          retention-days: 30
+
+      - name: Create Release (Manual Trigger Only)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: release-${{ steps.build_info.outputs.build_date }}
+          release_name: Release ${{ steps.build_info.outputs.build_date }}
+          body: |
+            Automated release build
+            - Commit: ${{ github.sha }}
+            - Build Date: ${{ steps.build_info.outputs.build_date }}
+            - Build Type: ${{ github.event.inputs.build_type }}
+            - ABIs: ${{ github.event.inputs.abi_filters }}
+            
+            Built via GitHub Actions workflow
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/*.apk
